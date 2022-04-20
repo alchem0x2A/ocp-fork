@@ -1,0 +1,22 @@
+program: main.py
+method: bayes
+metric:
+  name: val/loss
+  goal: minimize
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - "--config-yml"
+  - TAAG/gemnet-taag-co-sweep.yml
+  - "--mode"
+  - train
+  - "--identifier"
+  - taag-test-0
+  - "--checkpoint" 
+  - "/home/jovyan/shared-scratch/TT/gemnet_is2re_ft_zero.pt"
+  - ${args}
+parameters:
+  optim.lr_initial:
+    min: 0.000001
+    max: 0.001
