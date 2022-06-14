@@ -41,7 +41,7 @@ from ocpmodels.modules.evaluator import Evaluator
 from ocpmodels.modules.exponential_moving_average import (
     ExponentialMovingAverage,
 )
-from ocpmodels.modules.loss import DDPLoss, L2MAELoss
+from ocpmodels.modules.loss import AtomwiseL2Loss, DDPLoss, L2MAELoss
 from ocpmodels.modules.normalizer import Normalizer
 from ocpmodels.modules.scheduler import LRScheduler
 
@@ -394,6 +394,8 @@ class BaseTrainer(ABC):
         checkpoint = torch.load(checkpoint_path, map_location=map_location)
         self.epoch = checkpoint.get("epoch", 0)
         self.step = checkpoint.get("step", 0)
+        self.best_val_metric = checkpoint.get("best_val_metric", None)
+        self.primary_metric = checkpoint.get("primary_metric", None)
 
         # Load model, optimizer, normalizer state dict.
         # if trained with ddp and want to load in non-ddp, modify keys from
@@ -442,12 +444,13 @@ class BaseTrainer(ABC):
                 self.loss_fn[loss] = nn.MSELoss()
             elif loss_name == "l2mae":
                 self.loss_fn[loss] = L2MAELoss()
+            elif loss_name == "atomwisel2":
+                self.loss_fn[loss] = AtomwiseL2Loss()
             else:
                 raise NotImplementedError(
                     f"Unknown loss function name: {loss_name}"
                 )
-            if distutils.initialized():
-                self.loss_fn[loss] = DDPLoss(self.loss_fn[loss])
+            self.loss_fn[loss] = DDPLoss(self.loss_fn[loss])
 
     def load_optimizer(self):
         optimizer = self.config["optim"].get("optimizer", "AdamW")
@@ -526,6 +529,11 @@ class BaseTrainer(ABC):
                         "amp": self.scaler.state_dict()
                         if self.scaler
                         else None,
+                        "best_val_metric": self.best_val_metric,
+                        "primary_metric": self.config["task"].get(
+                            "primary_metric",
+                            self.evaluator.task_primary_metric[self.name],
+                        ),
                     },
                     checkpoint_dir=self.config["cmd"]["checkpoint_dir"],
                     checkpoint_file=checkpoint_file,
