@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import ocpmodels
-from ocpmodels.common import distutils
+from ocpmodels.common import distutils, gp_utils
 from ocpmodels.common.data_parallel import (
     BalancedBatchSampler,
     OCPDataParallel,
@@ -150,7 +150,13 @@ class BaseTrainer(ABC):
         self.scaler = torch.cuda.amp.GradScaler() if amp else None
 
         if "SLURM_JOB_ID" in os.environ and "folder" in self.config["slurm"]:
-            self.config["slurm"]["job_id"] = os.environ["SLURM_JOB_ID"]
+            if "SLURM_ARRAY_JOB_ID" in os.environ:
+                self.config["slurm"]["job_id"] = "%s_%s" % (
+                    os.environ["SLURM_ARRAY_JOB_ID"],
+                    os.environ["SLURM_ARRAY_TASK_ID"],
+                )
+            else:
+                self.config["slurm"]["job_id"] = os.environ["SLURM_JOB_ID"]
             self.config["slurm"]["folder"] = self.config["slurm"][
                 "folder"
             ].replace("%j", self.config["slurm"]["job_id"])
@@ -243,11 +249,17 @@ class BaseTrainer(ABC):
             balancing_mode = "atoms"
             force_balancing = False
 
+        if gp_utils.initialized():
+            num_replicas = gp_utils.get_dp_world_size()
+            rank = gp_utils.get_dp_rank()
+        else:
+            num_replicas = distutils.get_world_size()
+            rank = distutils.get_rank()
         sampler = BalancedBatchSampler(
             dataset,
             batch_size=batch_size,
-            num_replicas=distutils.get_world_size(),
-            rank=distutils.get_rank(),
+            num_replicas=num_replicas,
+            rank=rank,
             device=self.device,
             mode=balancing_mode,
             shuffle=shuffle,
@@ -397,24 +409,29 @@ class BaseTrainer(ABC):
         self.best_val_metric = checkpoint.get("best_val_metric", None)
         self.primary_metric = checkpoint.get("primary_metric", None)
 
-        # Load model, optimizer, normalizer state dict.
-        # if trained with ddp and want to load in non-ddp, modify keys from
-        # module.module.. -> module..
-        first_key = next(iter(checkpoint["state_dict"]))
-        if (
-            not distutils.initialized() or self.config["noddp"]
-        ) and first_key.split(".")[1] == "module":
-            # No need for OrderedDict since dictionaries are technically ordered
-            # since Python 3.6 and officially ordered since Python 3.7
-            new_dict = {k[7:]: v for k, v in checkpoint["state_dict"].items()}
-            self.model.load_state_dict(new_dict)
-        elif distutils.initialized() and first_key.split(".")[1] != "module":
+        # Match the "module." count in the keys of model and checkpoint state_dict
+        # DataParallel model has 1 "module.",  DistributedDataParallel has 2 "module."
+        # Not using either of the above two would have no "module."
+
+        ckpt_key_count = next(iter(checkpoint["state_dict"])).count("module")
+        mod_key_count = next(iter(self.model.state_dict())).count("module")
+        key_count_diff = mod_key_count - ckpt_key_count
+
+        if key_count_diff > 0:
             new_dict = {
-                f"module.{k}": v for k, v in checkpoint["state_dict"].items()
+                key_count_diff * "module." + k: v
+                for k, v in checkpoint["state_dict"].items()
             }
-            self.model.load_state_dict(new_dict)
+        elif key_count_diff < 0:
+            new_dict = {
+                k[len("module.") * abs(key_count_diff) :]: v
+                for k, v in checkpoint["state_dict"].items()
+            }
         else:
-            self.model.load_state_dict(checkpoint["state_dict"])
+            new_dict = checkpoint["state_dict"]
+
+        strict = self.config["task"].get("strict_load", True)
+        self.model.load_state_dict(new_dict, strict=strict)
 
         if "optimizer" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
